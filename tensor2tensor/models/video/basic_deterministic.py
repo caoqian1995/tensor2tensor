@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2018 The Tensor2Tensor Authors.
+# Copyright 2019 The Tensor2Tensor Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,46 +12,83 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """Basic models for testing simple tasks."""
 
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import six
-
 from tensor2tensor.layers import common_attention
 from tensor2tensor.layers import common_layers
+from tensor2tensor.layers import common_video
+from tensor2tensor.models.video import base
 from tensor2tensor.models.video import basic_deterministic_params  # pylint: disable=unused-import
 from tensor2tensor.utils import registry
-from tensor2tensor.utils import t2t_model
 
 import tensorflow as tf
 
 
-tfl = tf.layers
-tfcl = tf.contrib.layers
-
-
 @registry.register_model
-class NextFrameBasicDeterministic(t2t_model.T2TModel):
+class NextFrameBasicDeterministic(base.NextFrameBase):
   """Basic next-frame model, may take actions and predict rewards too."""
 
-  def inject_latent(self, layer, features, filters):
-    """Do nothing for deterministic model."""
-    del features, filters
+  @property
+  def is_recurrent_model(self):
+    return False
+
+  def inject_latent(self, layer, inputs, target, action):
+    del inputs, target, action
     return layer, 0.0
 
-  def body(self, features):
+  def middle_network(self, layer, internal_states):
+    # Run a stack of convolutions.
+    x = layer
+    kernel1 = (3, 3)
+    filters = common_layers.shape_list(x)[-1]
+    for i in range(self.hparams.num_hidden_layers):
+      with tf.variable_scope("layer%d" % i):
+        y = tf.nn.dropout(x, 1.0 - self.hparams.residual_dropout)
+        y = tf.layers.conv2d(y, filters, kernel1, activation=common_layers.belu,
+                             strides=(1, 1), padding="SAME")
+        if i == 0:
+          x = y
+        else:
+          x = common_layers.layer_norm(x + y)
+    return x, internal_states
+
+  def update_internal_states_early(self, internal_states, frames):
+    """Update the internal states early in the network if requested."""
+    del frames
+    return internal_states
+
+  def next_frame(self, frames, actions, rewards, target_frame,
+                 internal_states, video_extra):
+    del rewards, video_extra
+
     hparams = self.hparams
     filters = hparams.hidden_size
-    kernel1, kernel2 = (3, 3), (4, 4)
+    kernel2 = (4, 4)
+    action = actions[-1]
 
-    # Embed the inputs.
-    inputs_shape = common_layers.shape_list(features["inputs"])
+    # Stack the inputs.
+    if internal_states is not None and hparams.concat_internal_states:
+      # Use the first part of the first internal state if asked to concatenate.
+      batch_size = common_layers.shape_list(frames[0])[0]
+      internal_state = internal_states[0][0][:batch_size, :, :, :]
+      stacked_frames = tf.concat(frames + [internal_state], axis=-1)
+    else:
+      stacked_frames = tf.concat(frames, axis=-1)
+    inputs_shape = common_layers.shape_list(stacked_frames)
+
+    # Update internal states early if requested.
+    if hparams.concat_internal_states:
+      internal_states = self.update_internal_states_early(
+          internal_states, frames)
+
     # Using non-zero bias initializer below for edge cases of uniform inputs.
     x = tf.layers.dense(
-        features["inputs"], filters, name="inputs_embed",
+        stacked_frames, filters, name="inputs_embed",
         bias_initializer=tf.random_normal_initializer(stddev=0.01))
     x = common_attention.add_timing_signal_nd(x)
 
@@ -60,42 +97,43 @@ class NextFrameBasicDeterministic(t2t_model.T2TModel):
     for i in range(hparams.num_compress_steps):
       with tf.variable_scope("downstride%d" % i):
         layer_inputs.append(x)
+        x = tf.nn.dropout(x, 1.0 - self.hparams.dropout)
         x = common_layers.make_even_size(x)
         if i < hparams.filter_double_steps:
           filters *= 2
+        x = common_attention.add_timing_signal_nd(x)
         x = tf.layers.conv2d(x, filters, kernel2, activation=common_layers.belu,
                              strides=(2, 2), padding="SAME")
         x = common_layers.layer_norm(x)
 
+    if self.has_actions:
+      with tf.variable_scope("policy"):
+        x_flat = tf.layers.flatten(x)
+        policy_pred = tf.layers.dense(x_flat, self.hparams.problem.num_actions)
+        value_pred = tf.layers.dense(x_flat, 1)
+        value_pred = tf.squeeze(value_pred, axis=-1)
+    else:
+      policy_pred, value_pred = None, None
+
     # Add embedded action if present.
-    if "input_action" in features:
-      action = tf.reshape(features["input_action"][:, -1, :],
-                          [-1, 1, 1, hparams.hidden_size])
-      action_mask = tf.layers.dense(action, filters, name="action_mask")
-      zeros_mask = tf.zeros(common_layers.shape_list(x)[:-1] + [filters],
-                            dtype=tf.float32)
-      if hparams.concatenate_actions:
-        x = tf.concat([x, action_mask + zeros_mask], axis=-1)
-      else:
-        x *= action_mask + zeros_mask
+    if self.has_actions:
+      x = common_video.inject_additional_input(
+          x, action, "action_enc", hparams.action_injection)
 
-    x, extra_loss = self.inject_latent(x, features, filters)
+    # Inject latent if present. Only for stochastic models.
+    x, extra_loss = self.inject_latent(x, frames, target_frame, action)
 
-    # Run a stack of convolutions.
-    for i in range(hparams.num_hidden_layers):
-      with tf.variable_scope("layer%d" % i):
-        y = tf.layers.conv2d(x, filters, kernel1, activation=common_layers.belu,
-                             strides=(1, 1), padding="SAME")
-        y = tf.nn.dropout(y, 1.0 - hparams.dropout)
-        if i == 0:
-          x = y
-        else:
-          x = common_layers.layer_norm(x + y)
+    x_mid = tf.reduce_mean(x, axis=[1, 2], keepdims=True)
+    x, internal_states = self.middle_network(x, internal_states)
 
     # Up-convolve.
     layer_inputs = list(reversed(layer_inputs))
     for i in range(hparams.num_compress_steps):
       with tf.variable_scope("upstride%d" % i):
+        x = tf.nn.dropout(x, 1.0 - self.hparams.dropout)
+        if self.has_actions:
+          x = common_video.inject_additional_input(
+              x, action, "action_enc", hparams.action_injection)
         if i >= hparams.num_compress_steps - hparams.filter_double_steps:
           filters //= 2
         x = tf.layers.conv2d_transpose(
@@ -109,63 +147,19 @@ class NextFrameBasicDeterministic(t2t_model.T2TModel):
 
     # Cut down to original size.
     x = x[:, :inputs_shape[1], :inputs_shape[2], :]
-
-    # Reward prediction if needed.
-    if "target_reward" not in features:
-      return x
-    reward_pred = tf.reduce_mean(x, axis=[1, 2], keepdims=True)
-    return {"targets": x, "target_reward": reward_pred}, extra_loss
-
-  def infer(self, features, *args, **kwargs):  # pylint: disable=arguments-differ
-    """Produce predictions from the model by running it."""
-    del args, kwargs
-    # Inputs and features preparation needed to handle edge cases.
-    if not features:
-      features = {}
-    inputs_old = None
-    if "inputs" in features and len(features["inputs"].shape) < 4:
-      inputs_old = features["inputs"]
-      features["inputs"] = tf.expand_dims(features["inputs"], 2)
-
-    def logits_to_samples(logits):
-      """Get samples from logits."""
-      # If the last dimension is 1 then we're using L1/L2 loss.
-      if common_layers.shape_list(logits)[-1] == 1:
-        return tf.to_int32(tf.squeeze(logits, axis=-1))
-      # Argmax in TF doesn't handle more than 5 dimensions yet.
-      logits_shape = common_layers.shape_list(logits)
-      argmax = tf.argmax(tf.reshape(logits, [-1, logits_shape[-1]]), axis=-1)
-      return tf.reshape(argmax, logits_shape[:-1])
-
-    # Get predictions.
-    try:
-      num_channels = self.hparams.problem.num_channels
-    except AttributeError:
-      num_channels = 1
-    if "inputs" in features:
-      inputs_shape = common_layers.shape_list(features["inputs"])
-      targets_shape = [inputs_shape[0], self.hparams.video_num_target_frames,
-                       inputs_shape[2], inputs_shape[3], num_channels]
+    x_fin = tf.reduce_mean(x, axis=[1, 2], keepdims=True)
+    if self.is_per_pixel_softmax:
+      x = tf.layers.dense(x, hparams.problem.num_channels * 256, name="logits")
     else:
-      tf.logging.warn("Guessing targets shape as no inputs are given.")
-      targets_shape = [self.hparams.batch_size,
-                       self.hparams.video_num_target_frames, 1, 1, num_channels]
-    features["targets"] = tf.zeros(targets_shape, dtype=tf.int32)
-    if "target_reward" in self.hparams.problem_hparams.target_modality:
-      features["target_reward"] = tf.zeros(
-          [targets_shape[0], 1, 1], dtype=tf.int32)
-    logits, _ = self(features)  # pylint: disable=not-callable
-    if isinstance(logits, dict):
-      results = {}
-      for k, v in six.iteritems(logits):
-        results[k] = logits_to_samples(v)
-        results["%s_logits" % k] = v
-    else:
-      results = logits_to_samples(logits)
+      x = tf.layers.dense(x, hparams.problem.num_channels, name="logits")
 
-    # Restore inputs to not confuse Estimator in edge cases.
-    if inputs_old is not None:
-      features["inputs"] = inputs_old
+    reward_pred = None
+    if self.has_rewards:
+      # Reward prediction based on middle and final logits.
+      reward_pred = tf.concat([x_mid, x_fin], axis=-1)
+      reward_pred = tf.nn.relu(tf.layers.dense(
+          reward_pred, 128, name="reward_pred"))
+      reward_pred = tf.squeeze(reward_pred, axis=1)  # Remove extra dims
+      reward_pred = tf.squeeze(reward_pred, axis=1)  # Remove extra dims
 
-    # Return results.
-    return results
+    return x, reward_pred, policy_pred, value_pred, extra_loss, internal_states

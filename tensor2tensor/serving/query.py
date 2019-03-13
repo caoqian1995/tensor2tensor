@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2018 The Tensor2Tensor Authors.
+# Copyright 2019 The Tensor2Tensor Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """Query an exported model. Py2 only. Install tensorflow-serving-api."""
 from __future__ import absolute_import
 from __future__ import division
@@ -26,6 +27,7 @@ from tensor2tensor import problems as problems_lib  # pylint: disable=unused-imp
 from tensor2tensor.serving import serving_utils
 from tensor2tensor.utils import registry
 from tensor2tensor.utils import usr_dir
+from tensor2tensor.utils.hparam import HParams
 import tensorflow as tf
 
 flags = tf.flags
@@ -79,7 +81,7 @@ def main(_):
   validate_flags()
   usr_dir.import_usr_dir(FLAGS.t2t_usr_dir)
   problem = registry.problem(FLAGS.problem)
-  hparams = tf.contrib.training.HParams(
+  hparams = HParams(
       data_dir=os.path.expanduser(FLAGS.data_dir))
   problem.get_hparams(hparams)
   request_fn = make_request_fn()

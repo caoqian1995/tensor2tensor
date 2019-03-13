@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2018 The Tensor2Tensor Authors.
+# Copyright 2019 The Tensor2Tensor Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,10 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """Utils for attention mechanism for images."""
 
-from six.moves import range  # pylint: disable=redefined-builtin
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
 
+from six.moves import range  # pylint: disable=redefined-builtin
 from tensor2tensor.layers import common_attention
 from tensor2tensor.layers import common_layers
 from tensor2tensor.utils import expert_utils
@@ -319,10 +323,12 @@ def transformer_decoder_layers(inputs,
                                attention_type="local_mask_right",
                                q_padding="LEFT", kv_padding="LEFT")
       elif attention_type == AttentionType.RELATIVE_LOCAL_1D:
-        y = local_attention_1d(common_layers.layer_preprocess(x, hparams),
-                               hparams,
-                               attention_type="rel_local_mask_right",
-                               q_padding="LEFT", kv_padding="LEFT")
+        y = local_attention_1d(
+            common_layers.layer_preprocess(x, hparams),
+            hparams,
+            attention_type="local_relative_mask_right",
+            q_padding="LEFT",
+            kv_padding="LEFT")
       elif attention_type == AttentionType.NON_CAUSAL_1D:
         y = local_attention_1d(common_layers.layer_preprocess(x, hparams),
                                hparams,
@@ -463,68 +469,6 @@ def get_self_attention_bias(x):
   return self_attention_bias
 
 
-def transformer_layers_sharded(dp,
-                               ps_devices,
-                               inputs,
-                               num_layers,
-                               hparams,
-                               self_attention_bias=None,
-                               enc_output=None,
-                               attention_type=AttentionType.GLOBAL,
-                               name="transformer"):
-  """Multi layer transformer, sharded by the data parallelism dp."""
-  x = inputs
-  extra_loss = tf.constant(0.0)
-  moe_hidden_sizes = [int(s) for s in hparams.moe_hidden_sizes.split(",")]
-  expert_fn = expert_utils.ffn_expert_fn(
-      hparams.hidden_size, moe_hidden_sizes, hparams.hidden_size)
-  x = dp(tf.nn.dropout, x, 1.0 - hparams.layer_prepostprocess_dropout)
-  for layer in range(num_layers):
-    with tf.variable_scope("%s_layer_%d" % (name, layer)):
-      # self-attention
-      if attention_type == AttentionType.LOCAL_2D:
-        y = dp(local_attention_2d(common_layers.layer_preprocess(x, hparams),
-                                  hparams,
-                                  attention_type="masked_local_attention_2d"))
-      elif attention_type == AttentionType.LOCAL_1D:
-        y = dp(local_attention_1d(common_layers.layer_preprocess(x, hparams),
-                                  hparams,
-                                  attention_type="local_mask_right",
-                                  q_padding="LEFT", kv_padding="LEFT"))
-      elif attention_type == AttentionType.GLOCAL:
-        y = dp(local_global_attention(
-            common_layers.layer_preprocess(x, hparams), self_attention_bias,
-            hparams, q_padding="LEFT", kv_padding="LEFT"))
-      elif attention_type == AttentionType.GLOBAL:
-        self_attention_bias = dp(get_self_attention_bias(x))
-        y = dp(full_self_attention(common_layers.layer_preprocess(x, hparams),
-                                   self_attention_bias, hparams,
-                                   q_padding="LEFT", kv_padding="LEFT"))
-      x = common_layers.layer_postprocess(x, y, hparams)
-      if enc_output is not None:
-        y = dp(encdec_attention_1d(common_layers.layer_preprocess(x, hparams),
-                                   enc_output, None, hparams))
-        x = dp(common_layers.layer_postprocess, x, y, hparams)
-      with tf.variable_scope("ffn"):
-        if str(layer) in hparams.moe_layers_decoder.split(","):
-          y, loss = expert_utils.distributed_moe(
-              dp,
-              ps_devices,
-              common_layers.layer_preprocess(x, hparams),
-              hparams.mode == tf.estimator.ModeKeys.TRAIN,
-              input_size=hparams.hidden_size,
-              expert_fn=expert_fn,
-              num_experts=hparams.moe_num_experts,
-              k=hparams.moe_k,
-              loss_coef=hparams.moe_loss_coef)
-          extra_loss += loss
-          x = dp(common_layers.layer_postprocess, x, y, hparams)
-        else:
-          y = dp(ffn_layer, common_layers.layer_preprocess(x, hparams), hparams)
-          x = dp(common_layers.layer_postprocess, x, y, hparams)
-  return dp(common_layers.layer_preprocess, x, hparams), extra_loss
-
-
 def postprocess_image(x, rows, cols, hparams):
   """Postprocessing after decoding.
 
@@ -533,7 +477,7 @@ def postprocess_image(x, rows, cols, hparams):
       number of elements in x is batch * rows * cols * hparams.hidden_size.
     rows: Integer representing number of rows in a 2-D data point.
     cols: Integer representing number of columns in a 2-D data point.
-    hparams: tf.contrib.training.HParams set.
+    hparams: HParams set.
 
   Returns:
     Tensor of shape [batch, rows, cols, depth], where depth is
@@ -559,7 +503,7 @@ def postprocess_image(x, rows, cols, hparams):
                               use_bias=True,
                               activation=None,
                               name="output_conv")
-  if (hparams.mode == tf.contrib.learn.ModeKeys.INFER and
+  if (hparams.mode == tf.estimator.ModeKeys.PREDICT and
       hparams.block_raster_scan):
     y = targets
     yshape = common_layers.shape_list(y)
@@ -605,7 +549,7 @@ def prepare_decoder(targets, hparams):
 
   # during training, images are [batch, IMG_LEN, IMG_LEN, 3].
   # At inference, they are [batch, curr_infer_length, 1, 1]
-  if hparams.mode == tf.contrib.learn.ModeKeys.INFER:
+  if hparams.mode == tf.estimator.ModeKeys.PREDICT:
     curr_infer_length = targets_shape[1]
     if hparams.block_raster_scan:
       assert hparams.img_len*channels % hparams.query_shape[1] == 0
@@ -659,22 +603,9 @@ def prepare_decoder(targets, hparams):
 
 def prepare_image(inputs, hparams, name=None):
   """Prepare image."""
-  inputs_shape = common_layers.shape_list(inputs)
-  batch = inputs_shape[0]
-  orig_rows = inputs_shape[1]
-  orig_cols = inputs_shape[2]
-  channels = hparams.num_channels
-
-  hidden_size = hparams.hidden_size
-  # Only do lookup if the modality is identity
-  if hparams.target_modality == "image:identity":
-    inputs = tf.to_int32(inputs)
-    x = get_channel_embeddings(channels, inputs, hidden_size, name=name)
-  else:
-    x = inputs
-  x = tf.reshape(x, [batch, orig_rows, orig_cols * channels, hidden_size])
-
-  return x
+  # TODO(trandustin): This is a legacy function. Remove its usage.
+  del hparams, name  # unused arg
+  return inputs
 
 
 def create_output(decoder_output, rows, cols, targets, hparams):
@@ -687,7 +618,7 @@ def create_output(decoder_output, rows, cols, targets, hparams):
     cols: Integer representing number of columns in a 2-D data point.
     targets: Tensor of shape [batch, hparams.img_len, hparams.img_len,
       hparams.num_channels].
-    hparams: tf.contrib.training.HParams set.
+    hparams: HParams set.
 
   Returns:
     Tensor of shape [batch, hparams.img_len, hparams.img_len,
@@ -695,17 +626,19 @@ def create_output(decoder_output, rows, cols, targets, hparams):
     [batch, hparams.img_len, hparams.img_len, hparams.num_channels, 256].
     In the special case of predict mode, it is a Tensor of rank 5.
   """
+  del targets  # unused arg
   decoded_image = postprocess_image(decoder_output, rows, cols, hparams)
+  batch = common_layers.shape_list(decoded_image)[0]
   depth = common_layers.shape_list(decoded_image)[-1]
-  batch, height, width, channels = common_layers.shape_list(targets)
   likelihood = getattr(hparams, "likelihood", DistributionType.CAT)
   if hparams.mode == tf.estimator.ModeKeys.PREDICT:
     y = tf.reshape(decoded_image, [batch, -1, 1, 1, depth])
-    output = y[:, :height, :, :, :]
+    output = y[:, :rows, :, :, :]
   elif likelihood == DistributionType.CAT:
     # Unpack the cols dimension of the Categorical.
+    channels = hparams.num_channels
     output = tf.reshape(decoded_image,
-                        [batch, height, width, channels, depth])
+                        [batch, rows, cols // channels, channels, depth])
   else:
     output = decoded_image
   return output

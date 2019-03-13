@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2018 The Tensor2Tensor Authors.
+# Copyright 2019 The Tensor2Tensor Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 r"""Decode from trained T2T models.
 
 This binary performs inference using the Estimator API.
@@ -48,10 +49,6 @@ FLAGS = flags.FLAGS
 # Additional flags in bin/t2t_trainer.py and utils/flags.py
 flags.DEFINE_string("checkpoint_path", None,
                     "Path to the model checkpoint. Overrides output_dir.")
-flags.DEFINE_string("decode_from_file", None,
-                    "Path to the source file for decoding")
-flags.DEFINE_string("decode_to_file", None,
-                    "Path to the decoded (output) file")
 flags.DEFINE_bool("keep_timestamp", False,
                   "Set the mtime of the decoded file to the "
                   "checkpoint_path+'.index' mtime.")
@@ -75,7 +72,10 @@ def create_decode_hparams():
   decode_hp = decoding.decode_hparams(FLAGS.decode_hparams)
   decode_hp.shards = FLAGS.decode_shards
   decode_hp.shard_id = FLAGS.worker_id
-  decode_hp.decode_in_memory = FLAGS.decode_in_memory
+  decode_in_memory = FLAGS.decode_in_memory or decode_hp.decode_in_memory
+  decode_hp.decode_in_memory = decode_in_memory
+  decode_hp.decode_to_file = FLAGS.decode_to_file
+  decode_hp.decode_reference = FLAGS.decode_reference
   return decode_hp
 
 
@@ -87,8 +87,6 @@ def decode(estimator, hparams, decode_hp):
     decoding.decode_interactively(estimator, hparams, decode_hp,
                                   checkpoint_path=FLAGS.checkpoint_path)
   elif FLAGS.decode_from_file:
-    if estimator.config.use_tpu:
-      raise ValueError("TPU can only decode from dataset.")
     decoding.decode_from_file(estimator, FLAGS.decode_from_file, hparams,
                               decode_hp, FLAGS.decode_to_file,
                               checkpoint_path=FLAGS.checkpoint_path)
@@ -102,7 +100,8 @@ def decode(estimator, hparams, decode_hp):
         hparams,
         decode_hp,
         decode_to_file=FLAGS.decode_to_file,
-        dataset_split="test" if FLAGS.eval_use_test_set else None)
+        dataset_split="test" if FLAGS.eval_use_test_set else None,
+        checkpoint_path=FLAGS.checkpoint_path)
 
 
 def score_file(filename):
@@ -118,10 +117,10 @@ def score_file(filename):
     batch_inputs = tf.reshape(inputs_ph, [1, -1, 1, 1])  # Make it 4D.
   targets_ph = tf.placeholder(dtype=tf.int32)  # Just length dimension.
   batch_targets = tf.reshape(targets_ph, [1, -1, 1, 1])  # Make it 4D.
-  features = {
-      "inputs": batch_inputs,
-      "targets": batch_targets,
-  } if has_inputs else {"targets": batch_targets}
+  if has_inputs:
+    features = {"inputs": batch_inputs, "targets": batch_targets}
+  else:
+    features = {"targets": batch_targets}
 
   # Prepare the model and the graph when model runs on features.
   model = registry.model(FLAGS.model)(hparams, tf.estimator.ModeKeys.EVAL)
@@ -152,10 +151,10 @@ def score_file(filename):
       if has_inputs:
         inputs_numpy = encoders["inputs"].encode(inputs) + [text_encoder.EOS_ID]
       # Prepare the feed.
-      feed = {
-          inputs_ph: inputs_numpy,
-          targets_ph: targets_numpy
-      } if has_inputs else {targets_ph: targets_numpy}
+      if has_inputs:
+        feed = {inputs_ph: inputs_numpy, targets_ph: targets_numpy}
+      else:
+        feed = {targets_ph: targets_numpy}
       # Get the score.
       np_loss = sess.run(losses["training"], feed)
       results.append(np_loss)
@@ -195,4 +194,5 @@ def main(_):
 
 
 if __name__ == "__main__":
+  tf.logging.set_verbosity(tf.logging.INFO)
   tf.app.run()

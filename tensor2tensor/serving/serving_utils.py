@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2018 The Tensor2Tensor Authors.
+# Copyright 2019 The Tensor2Tensor Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """Utilities for serving tensor2tensor."""
 
 from __future__ import absolute_import
@@ -25,7 +26,7 @@ import grpc
 
 from tensor2tensor import problems as problems_lib  # pylint: disable=unused-import
 from tensor2tensor.data_generators import text_encoder
-from tensor2tensor.utils import cloud_tpu as cloud
+from tensor2tensor.utils import cloud_mlengine as cloud
 import tensorflow as tf
 from tensorflow_serving.apis import predict_pb2
 from tensorflow_serving.apis import prediction_service_pb2_grpc
@@ -107,16 +108,16 @@ def make_grpc_request_fn(servable_name, server, timeout_secs):
     request = predict_pb2.PredictRequest()
     request.model_spec.name = servable_name
     request.inputs["input"].CopyFrom(
-        tf.contrib.util.make_tensor_proto(
+        tf.make_tensor_proto(
             [ex.SerializeToString() for ex in examples], shape=[len(examples)]))
     response = stub.Predict(request, timeout_secs)
     outputs = tf.make_ndarray(response.outputs["outputs"])
     scores = tf.make_ndarray(response.outputs["scores"])
     assert len(outputs) == len(scores)
     return [{
-        "outputs": outputs[i],
-        "scores": scores[i]
-    } for i in range(len(outputs))]
+        "outputs": output,
+        "scores": score
+    } for output, score in zip(outputs, scores)]
 
   return _make_grpc_request
 
